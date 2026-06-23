@@ -1,0 +1,201 @@
+﻿@startuml sequence_bid_request
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam sequenceArrowColor #333333
+
+title Sequence Diagram: Bid Request Flow (MVP)
+
+participant DSP as "DSP Partner"
+participant GW as "API Gateway\n(Kong)"
+participant RTB as "RTB Service"
+participant Cache as "Redis Cache"
+participant Campaign as "Campaign\nService"
+participant DB as "PostgreSQL\nMaster"
+participant Kafka as "Kafka Broker"
+
+autonumber
+
+== Request Phase ==
+
+DSP -> GW: POST /v2/bid\nOpenRTB BidRequest\n(100ms deadline)
+
+activate GW
+GW -> GW: Parse JSON (1ms)
+GW -> GW: Validate schema (0.5ms)
+GW -> GW: Rate limit check (0.5ms)
+note over GW
+  Check X-DSP-Key quota
+  100K RPM per partner
+  Add correlation_id
+end note
+
+GW -> RTB: gRPC call\ngetActiveCampaigns()\n(with 95ms deadline)
+deactivate GW
+
+activate RTB
+note over RTB
+  Start: 1ms
+  Budget: 95ms
+end note
+
+RTB -> Cache: GET campaigns:active
+activate Cache
+Cache -> Cache: Lookup in memory (1ms)
+note over Cache
+  95% hit rate
+  If miss → query DB
+end note
+
+alt Cache Hit (95% of time)
+  Cache --> RTB: CampaignDTOs (1ms)
+  deactivate Cache
+else Cache Miss (5% of time)
+  Cache -> Campaign: gRPC: GetCampaigns()\n(5ms timeout)
+  
+  activate Campaign
+  Campaign -> DB: SELECT campaigns\nWHERE is_active=true
+  activate DB
+  DB --> Campaign: 100 campaigns (2ms)
+  deactivate DB
+  
+  Campaign --> RTB: CampaignDTOs (2ms)
+  deactivate Campaign
+  
+  Cache -> Cache: Store in cache\n(TTL: 5min)
+  Cache --> RTB: CampaignDTOs (5ms total)
+  deactivate Cache
+end
+
+note over RTB
+  Campaigns acquired: ~1-5ms ✅
+  Budget remaining: ~90-94ms
+end note
+
+== Auction Phase ==
+
+RTB -> RTB: Match campaigns\n(geo, device, interests)\n(5ms)
+
+RTB -> RTB: Run auction\n(select winner by bid)\n(30ms)
+note over RTB
+  For each matching campaign:
+  - Evaluate targeting rules
+  - Calculate final bid (CPM)
+  - Track impressions counter
+end note
+
+RTB -> RTB: Render creative HTML\n(get banner URL)\n(10ms)
+
+RTB -> RTB: Build response\nOpenRTB BidResponse\n(3ms)
+
+== Response Phase ==
+
+RTB --> GW: BidResponse (JSON)
+note over RTB
+  Total RTB time: ~48ms ✅
+  Within 95ms budget
+end note
+deactivate RTB
+
+activate GW
+GW -> GW: Add response headers\nX-Response-Time: 48ms
+GW --> DSP: HTTP 200 OK\nOpenRTB BidResponse\n(1ms)
+deactivate GW
+
+note over DSP, GW
+  Total: ~50ms P99 ✅
+  Well within 100ms deadline!
+end note
+
+== Async Event Phase (Non-blocking) ==
+
+RTB -> Kafka: PublishEvent()\nimpression.recorded\n(event_id: unique, non-blocking)
+
+activate Kafka
+note over RTB, Kafka
+  This happens AFTER response
+  sent to DSP (no latency impact)
+end note
+
+Kafka -> Kafka: Enqueue message\nPartition: campaign_id % 10
+
+== Analytics Consumer ==
+
+Kafka -> RTB: (time passes)\nAnalytics Consumer\nreads event\n(async, 100-500ms later)
+note over Kafka
+  Consumer group: analytics-impressions
+  Offset committed after processing
+  Latency: 100-500ms OK
+end note
+
+== Financial Consumer ==
+
+Kafka -> RTB: Financial Consumer\nreads event\n(async, must be <1s)
+
+activate RTB
+RTB -> RTB: Check: already processed?\n(event_id deduplication)
+note over RTB
+  Use processed_events table
+  + event_id in dedup cache
+  Ensures exactly-once semantics
+end note
+
+alt Event not processed yet
+  RTB -> DB: BEGIN TRANSACTION
+  activate DB
+  
+  RTB -> DB: INSERT processed_events\n(event_id)
+  
+  RTB -> DB: UPDATE campaigns\nSET spent_today_cents += price\nWHERE id = campaign_id
+  
+  RTB -> DB: SELECT spent_today_cents,\ndaily_budget_cents\nFROM campaigns
+  
+  note over RTB
+    Check if budget exceeded
+  end note
+  
+  alt Budget Exceeded
+    RTB -> DB: UPDATE campaigns\nSET is_paused = true
+    note over RTB
+      Alert: campaign paused
+    end note
+  end
+  
+  RTB -> DB: COMMIT TRANSACTION
+  deactivate DB
+  
+  Kafka --> RTB: ✓ Committed offset
+else Event already processed
+  Kafka --> RTB: ✓ Skipped (idempotent)
+  note over Kafka, RTB
+    Duplicate event detected
+    Safe to skip (at-least-once delivery)
+  end note
+end
+deactivate RTB
+deactivate Kafka
+
+== Error Scenarios ==
+
+note over RTB
+  
+  === Circuit Breaker Scenarios ===
+  
+  If Campaign Service fails:
+  • 1st error: try again
+  • 5 consecutive errors: OPEN
+  • Return cached campaigns or default
+  • Latency impact: minimal (fallback in 1ms)
+  
+  If Kafka fails:
+  • Non-blocking (doesn't affect response)
+  • Queue locally in memory
+  • Retry when Kafka recovers
+  
+  If Redis fails:
+  • Cache miss: query DB (5-10ms)
+  • P95 latency: 50ms → 70-80ms
+  • Still within 100ms budget ✅
+  
+end note
+
+@enduml

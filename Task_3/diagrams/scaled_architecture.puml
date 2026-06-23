@@ -1,0 +1,73 @@
+﻿@startuml scaled_architecture
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+
+title C4 Container Diagram — AdScale Scaled Architecture (Target)
+
+System_Ext(dspPartner, "DSP-партнёр", "")
+
+System_Boundary(frontend, "Frontend Layer") {
+    Container(nginx1, "Nginx LB 1", "Nginx", "Load balancer")
+    Container(nginx2, "Nginx LB 2", "Nginx", "Load balancer")
+}
+
+System_Boundary(apiLayer, "API + BFF Layer") {
+    Container(bff1, "BFF Pod 1", "Go", "Validation, rate limit")
+    Container(bff2, "BFF Pod 2", "Go", "Validation, rate limit")
+    Container(bff3, "BFF Pod 3", "Go", "Validation, rate limit")
+}
+
+System_Boundary(serviceMesh, "Service Mesh (Istio + Envoy)") {
+    Container(envoyProxy, "Envoy Proxy Network", "Envoy", "Circuit breaking, retries, tracing")
+}
+
+System_Boundary(microservices, "Microservices (5 replicas each)") {
+    Container(biddingService, "Bidding Service", "Go", "P99 < 50ms")
+    Container(campaignService, "Campaign Service", "Go", "Campaign CRUD")
+    Container(analyticsService, "Analytics Service", "Python", "OLAP aggregations")
+    Container(financialService, "Financial Service", "Go", "SAGA pattern, exactly-once")
+    Container(adminService, "Admin Service", "Node.js", "Internal APIs")
+}
+
+System_Boundary(dataLayer, "Data Layer") {
+    Container(kafkaCluster, "Kafka Cluster (HA)", "Kafka", "3-broker replication, 10 partitions")
+    Container(redisCluster, "Redis Cluster", "Redis", "Distributed cache, 6 nodes")
+    Container(postgresCluster, "PostgreSQL Cluster", "PostgreSQL", "Master + 2 read replicas, sharded")
+}
+
+Container(monitoring, "Observability Stack", "Prometheus/Jaeger/ELK", "Metrics, traces, logs")
+
+Rel(dspPartner, nginx1, "Bid requests", "HTTPS/OpenRTB")
+Rel(dspPartner, nginx2, "Bid requests", "HTTPS/OpenRTB")
+Rel(nginx1, bff1, "Route", "")
+Rel(nginx2, bff2, "Route", "")
+Rel(bff1, envoyProxy, "Forward", "via sidecar")
+Rel(bff2, envoyProxy, "Forward", "via sidecar")
+Rel(bff3, envoyProxy, "Forward", "via sidecar")
+
+Rel(envoyProxy, biddingService, "Get bid", "gRPC")
+Rel(envoyProxy, campaignService, "Get campaigns", "gRPC")
+Rel(envoyProxy, analyticsService, "Analytics", "gRPC")
+Rel(envoyProxy, financialService, "Payments", "gRPC")
+
+Rel(biddingService, redisCluster, "Read cache", "")
+Rel(biddingService, postgresCluster, "Read bids", "")
+Rel(biddingService, kafkaCluster, "Publish events", "async")
+
+Rel(financialService, kafkaCluster, "Consume", "exactly-once")
+Rel(analyticsService, kafkaCluster, "Consume", "batch")
+
+Rel(postgresCluster, monitoring, "Expose metrics", "")
+Rel(envoyProxy, monitoring, "Send telemetry", "")
+
+legend right
+  Fully Distributed Architecture
+  18K → 50K RPS
+  P99 < 50ms globally
+  99.9% SLA
+  Multi-region capable
+  Auto-scaling enabled
+endlegend
+@enduml
+

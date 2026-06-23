@@ -1,0 +1,44 @@
+﻿@startuml services_component
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+LAYOUT_WITH_LEGEND()
+
+title C4 Component Diagram — Bidding Service Internals
+
+Container(biddingService, "Bidding Service", "Go/Rust") {
+    Component(apiHandler, "API Handler", "HTTP handler", "Parse OpenRTB requests")
+    Component(campaignMatcher, "Campaign Matcher", "Logic", "Match targeting criteria")
+    Component(auctionEngine, "Auction Engine", "Logic", "Run auction, pick winner")
+    Component(adRenderer, "Ad Renderer", "Logic", "Format creative HTML")
+    Component(responseBuilder, "Response Builder", "HTTP", "Format OpenRTB response")
+    Component(eventEmitter, "Event Emitter", "Kafka producer", "Publish impressions")
+    Component(circuitBreaker, "Circuit Breaker", "Pattern", "Handle Campaign Service failures")
+    Component(cache, "Cache Client", "Redis", "Campaign cache with fallback")
+}
+
+ContainerDb(db, "PostgreSQL", "OLTP DB", "Bids, impressions")
+Container(redisCache, "Redis", "Cache", "Campaigns, budgets")
+Container(campaignService, "Campaign Service", "gRPC", "External service")
+Container(kafka, "Kafka", "Event broker", "Impressions topic")
+
+Rel(apiHandler, campaignMatcher, "Request", "")
+Rel(campaignMatcher, auctionEngine, "Candidates", "")
+Rel(auctionEngine, adRenderer, "Winner", "")
+Rel(adRenderer, responseBuilder, "Creative", "")
+Rel(responseBuilder, apiHandler, "Response", "")
+Rel(apiHandler, eventEmitter, "After response", "async")
+
+Rel(campaignMatcher, cache, "Get campaigns", "Redis lookup")
+Rel(cache, circuitBreaker, "Fallback", "gRPC to Campaign Service")
+Rel(circuitBreaker, campaignService, "Get campaigns", "5ms timeout")
+
+Rel(auctionEngine, db, "Read bids", "SQL")
+Rel(eventEmitter, kafka, "Send impression", "non-blocking")
+
+legend right
+  Critical path: P99 < 50ms
+  Cache hit ratio: 95%+
+  Fallback strategies active
+endlegend
+@enduml
+

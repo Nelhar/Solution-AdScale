@@ -1,0 +1,246 @@
+﻿@startuml sequence_kafka_events
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam sequenceArrowColor #333333
+
+title Sequence Diagram: Async Event Processing via Kafka (MVP)
+
+participant RTB as "RTB Service"
+participant Kafka as "Kafka\nBroker"
+participant Analytics as "Analytics\nConsumer"
+participant Financial as "Financial\nConsumer"
+participant TimeSeries as "TimeSeries DB\n(InfluxDB)"
+participant PG as "PostgreSQL\nMaster"
+
+autonumber
+
+== Event Publishing (Non-blocking) ==
+
+note over RTB
+  After sending BidResponse to DSP
+  (typically 50-100ms after auction)
+end note
+
+RTB -> Kafka: PublishEvent()\nimpression.recorded\n{\n  event_id: "evt-abc123",\n  campaign_id: "camp-789",\n  price: 550,\n  user_id: "user-123",\n  timestamp: now()\n}
+
+activate Kafka
+note over Kafka
+  Partitioning key: campaign_id
+  Ensures ordering within campaign
+  
+  Message enqueued immediately
+  Fire-and-forget (non-blocking)
+  Latency: ~1ms
+end note
+
+note over RTB
+  RTB doesn't wait for ACK
+  Response already sent to DSP!
+  Event publishing is background task
+end note
+deactivate RTB
+
+== Topic Partitioning ==
+
+Kafka -> Kafka: Determine partition\npartition = hash(campaign_id) % 10\nIn this case: partition 9
+
+note over Kafka
+  10 partitions total
+  Campaigns 9,19,29,... → partition 9
+  Allows parallel consumption
+  Ordering guaranteed per partition
+end note
+
+== Analytics Consumer Group ==
+
+note over Kafka
+  Consumer group: analytics-impressions
+  Rebalance: each partition → one consumer
+end note
+
+Kafka -> Analytics: Fetch messages\nfrom partition 9\n(batch: up to 100 messages)
+
+activate Analytics
+
+note over Analytics
+  Processing latency: OK up to 500ms
+  Purpose: aggregation + dashboards
+  Not time-critical
+end note
+
+Analytics -> Analytics: Parse JSON\nimpression.recorded
+
+Analytics -> Analytics: Aggregate statistics\nfor this time window:\n{\n  campaign_id: "camp-789",\n  date: "2026-06-22",\n  impressions: +1,\n  clicks: (later in clicks topic),\n  spend_cents: +550\n}
+
+note over Analytics
+  Update in-memory counters
+  Periodically flush to DB (e.g., every 1 min)
+end note
+
+Analytics -> TimeSeries: WriteMetrics()\nmetric: impressions\ntags: {campaign: camp-789, date: 2026-06-22}\nvalue: +1
+
+activate TimeSeries
+TimeSeries -> TimeSeries: Append to time series
+note over TimeSeries
+  InfluxDB stores metrics
+  Used for dashboards
+  Real-time analytics
+end note
+TimeSeries --> Analytics: ✓ OK (100ms)
+deactivate TimeSeries
+
+Analytics -> Kafka: CommitOffset()\noffset: message #N
+
+note over Kafka
+  Offset stored in Kafka
+  If consumer restarts:
+  - Resume from last offset
+  - No reprocessing ✅
+end note
+
+Kafka --> Analytics: ✓ Committed
+deactivate Analytics
+
+== Financial Consumer Group ==
+
+note over Kafka
+  Consumer group: financial-impressions
+  Different consumer group reads same messages!
+  Independent offset tracking
+end note
+
+Kafka -> Financial: Fetch messages\nfrom partition 9\n(batch: up to 50 messages)
+
+activate Financial
+
+note over Financial
+  Processing latency: must be <1s
+  Purpose: budget tracking + enforcement
+  Time-sensitive (payment-related)
+  
+  REQUIREMENT: Exactly-once processing
+end note
+
+Financial -> Financial: Parse JSON\nimpression.recorded
+
+Financial -> Financial: Check deduplication\nHave we seen event_id before?
+note over Financial
+  Check in-memory dedup cache
+  + check processed_events table
+  
+  Ensures idempotency
+  Safe to retry this event
+end note
+
+alt Event_id not seen before
+  
+  Financial -> PG: BEGIN TRANSACTION
+  
+  activate PG
+  note over PG
+    Transactional writes
+    Ensures consistency
+  end note
+  
+  Financial -> PG: INSERT processed_events\n(event_id, campaign_id, timestamp)
+  note over PG
+    Deduplication record
+    Prevents reprocessing if consumer restarts
+  end note
+  
+  Financial -> PG: UPDATE campaigns\nSET spent_today_cents = spent_today_cents + 550\nWHERE id = 'camp-789'
+  
+  Financial -> PG: SELECT spent_today_cents, daily_budget_cents\nFROM campaigns\nWHERE id = 'camp-789'
+  
+  activate PG
+  note over PG
+    spending_now: 455000 cents
+    daily_budget: 500000 cents
+    remaining: 45000 cents
+  end note
+  PG --> Financial: {spent: 455000, budget: 500000}
+  deactivate PG
+  
+  alt spent >= budget
+    Financial -> PG: UPDATE campaigns\nSET is_paused = true\nWHERE id = 'camp-789'
+    
+    note over Financial
+      Campaign paused!
+      Alert sent to advertiser
+      No more ads will be shown
+    end note
+  end
+  
+  Financial -> PG: COMMIT TRANSACTION
+  deactivate PG
+  
+  note over Financial
+    Transaction complete
+    All-or-nothing guarantee ✅
+  end note
+  
+else Event_id already processed
+  
+  note over Financial
+    We've seen this event before
+    Skip processing (idempotent)
+    But still commit offset
+  end note
+  
+end
+
+Financial -> Kafka: CommitOffset()\noffset: message #N
+
+Kafka --> Financial: ✓ Committed
+deactivate Financial
+
+== Timeline Visualization ==
+
+note over RTB, PG
+  
+  === Timeline Example ===
+  
+  14:30:00.000 - Impression served to user
+  14:30:00.050 - BidResponse sent to DSP ✓
+  14:30:00.051 - impression.recorded event published to Kafka
+  
+  14:30:00.100 - Analytics consumer picks up event
+  14:30:00.150 - Analytics processes & writes to TimeSeries
+  
+  14:30:00.100 - Financial consumer picks up event
+  14:30:00.200 - Financial updates budget ledger
+  
+  === Key Points ===
+  
+  • RTB path: 50ms (critical) ✓
+  • Kafka publish: 1ms (non-blocking) ✓
+  • Analytics: 100-500ms OK ✓
+  • Financial: 100ms OK (<1s requirement) ✓
+  • Ordering: guaranteed per partition (campaign_id) ✓
+  • Deduplication: event_id ensures exactly-once ✓
+  
+end note
+
+== Failure Scenarios ==
+
+note over Kafka
+  
+  === Kafka Broker Down ===
+  • RTB service: local queue (persist to disk)
+  • Analytics: paused (resume when back)
+  • Financial: paused (resume when back)
+  • No data loss (backlog persists)
+  
+  === Consumer Crash ===
+  • Kafka rebalances partitions
+  • Another consumer takes over
+  • Resume from last committed offset
+  • No reprocessing (offset tracking)
+  
+  === Duplicate Event ===
+  • Consumer retries (at-least-once)
+  • event_id deduplication prevents double-charging ✓
+  
+end note
+
+@enduml

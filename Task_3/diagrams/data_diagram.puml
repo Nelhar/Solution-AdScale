@@ -1,0 +1,68 @@
+﻿@startuml data_diagram
+!include <C4/C4_Container>
+
+LAYOUT_WITH_LEGEND()
+
+title Data Model Diagram — AdScale Scaled Architecture
+
+' Bidding Database
+System_Boundary(biddb, "Bidding Database (Sharded 0-3)") {
+    ContainerDb(imp, "impressions", "PostgreSQL", "id, campaign_id, user_id, price, timestamp\nPartitioned by date, Sharded by campaign_id\n10B+ rows")
+    ContainerDb(bids_db, "bids", "PostgreSQL", "bid_id, campaign_id, price_floor\nAppend-only log\n1B+ rows")
+}
+
+' Campaign Database
+System_Boundary(campdb, "Campaign Database (Master-Slave)") {
+    ContainerDb(camp, "campaigns", "PostgreSQL", "id, advertiser_id, name, budget, is_active\nIdx: (advertiser_id, is_active)\n100K rows")
+    ContainerDb(budget_db, "budgets", "PostgreSQL", "campaign_id, daily_spent, monthly_spent\nReal-time updates\n100K rows")
+    ContainerDb(target, "targeting_rules", "PostgreSQL", "campaign_id, geo, category, min_price\nCached in Redis\n500K rows")
+}
+
+' Financial Database
+System_Boundary(findb, "Financial Database (Event Sourcing)") {
+    ContainerDb(ledger, "ledger", "PostgreSQL", "id, campaign_id, tx_type, amount, timestamp\nAppend-only, Event Sourced\n100M+ rows")
+    ContainerDb(invoice_db, "invoices", "PostgreSQL", "id, advertiser_id, period, total_amount\nImmutable, read-only\n1M rows")
+    ContainerDb(balance, "balances", "PostgreSQL", "advertiser_id, current_balance\nReal-time, updated via SAGA\n1K rows")
+}
+
+' Analytics Database
+System_Boundary(analyticsdb, "Analytics Database (TimeSeries)") {
+    ContainerDb(imp_metrics, "impressions_metrics", "InfluxDB", "timestamp, campaign_id, count, sum_price\nHourly aggregation\n1M rows/day, 1-year retention")
+    ContainerDb(click_metrics, "clicks_metrics", "InfluxDB", "timestamp, campaign_id, count, click_rate\nHourly aggregation\n100K rows/day")
+    ContainerDb(perf, "performance", "InfluxDB", "timestamp, campaign_id, ctr, cpc\nComputed metrics for dashboards")
+}
+
+' Redis Cache
+System_Boundary(redis_sys, "Redis Cache (Distributed Cluster 6 nodes)") {
+    Container(redis_camp, "campaigns_cache", "Redis", "Key: campaigns:{id}\nValue: Campaign DTO\nTTL: 5 min, Size: 10MB")
+    Container(redis_budget, "budgets_cache", "Redis", "Key: budgets:{id}\nValue: spend amount\nTTL: 1 min, Size: 1MB")
+    Container(redis_floors, "bid_floors_cache", "Redis", "Key: bidfloors:{geo}:{cat}\nTTL: 30 min, Size: 100KB")
+    Container(redis_counters, "impression_counters", "Redis", "Key: impressions:count:{id}:{date}\nTTL: 24h, auto-expire UTC")
+}
+
+' Kafka Topics
+System_Boundary(kafka_sys, "Kafka Cluster (3 brokers, replication=3)") {
+    Container(kafka_imp, "impressions.recorded", "Kafka", "Partitions: 10 (by campaign_id)\nRetention: 1 day\nReplication Factor: 3")
+    Container(kafka_click, "clicks.recorded", "Kafka", "Partitions: 10\nRetention: 1 day\nReplication Factor: 3")
+    Container(kafka_trans, "transactions.completed", "Kafka", "Partitions: 5\nRetention: 7 days (financial)\nReplication Factor: 3")
+    Container(kafka_camp, "campaigns.updated", "Kafka", "Partitions: 3\nRetention: 1 hour (cache invalidation)")
+}
+
+' Relationships
+Rel(imp, redis_camp, "Cache miss fallback", "read")
+Rel(bids_db, redis_floors, "Bid floor lookup", "read")
+Rel(budget_db, redis_budget, "Spend tracking", "read")
+
+Rel(imp, kafka_imp, "Log impressions", "publish")
+Rel(ledger, kafka_trans, "Financial events", "publish/consume")
+Rel(imp_metrics, kafka_imp, "Consume events", "batch aggregate")
+
+legend right
+  Bidding DB: 4 shards, hash(campaign_id) % 4
+  Campaign DB: Master for writes, 2 read-replicas
+  Financial DB: Event Sourcing, exactly-once via Kafka
+  Analytics DB: TimeSeries (InfluxDB), 1-year retention
+  Redis: Distributed cache, 6 nodes, Sentinel HA
+  Kafka: HA cluster, 3 brokers, replication factor 3
+endlegend
+@enduml

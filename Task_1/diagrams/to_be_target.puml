@@ -1,0 +1,57 @@
+﻿@startuml to_be_target
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+
+title C4 Container Diagram — AdScale (TO-BE Target - Microservices)
+
+Person(advertiser, "Рекламодатель", "")
+Person_Ext(endUser, "Пользователь сайта/приложения", "")
+System_Ext(dspPartner, "DSP-партнёр", "")
+
+Container(apiGateway, "API Gateway", "Kong/Nginx", "OpenRTB endpoint, rate limiting")
+
+Container(biddingService, "Bidding Service", "Go/Rust", "Bidding logic, P99 < 50ms")
+Container(campaignService, "Campaign Service", "Go", "Campaign management, CRUD")
+Container(analyticsService, "Analytics Service", "Python/Spark", "OLAP, reporting")
+Container(financialService, "Financial Service", "Go", "Payments, SAGA pattern")
+Container(adminService, "Admin Service", "Node.js", "Internal management")
+Container(notificationService, "Notification Service", "Node.js", "Alerts, emails")
+
+Container(kafka, "Kafka Cluster (3-broker HA)", "Kafka", "Distributed event log")
+Container(redis, "Redis Cluster", "Redis", "Distributed cache")
+
+ContainerDb(rtbDB, "RTB DB", "PostgreSQL", "Bids, impressions")
+ContainerDb(campaignDB, "Campaign DB", "PostgreSQL", "Campaigns, budgets")
+ContainerDb(analyticsDB, "Analytics DB", "TimeSeries DB", "Aggregated metrics")
+ContainerDb(financialDB, "Financial DB", "PostgreSQL", "Ledger, transactions")
+
+Container(serviceMesh, "Service Mesh (Istio)", "Istio/Envoy", "Traffic management, observability")
+
+Rel(dspPartner, apiGateway, "Bid requests", "OpenRTB")
+Rel(apiGateway, biddingService, "Route bid", "gRPC")
+Rel(biddingService, campaignService, "Get campaigns", "gRPC")
+Rel(biddingService, redis, "Cache lookup", "")
+Rel(biddingService, rtbDB, "Log impressions", "")
+Rel(biddingService, kafka, "Publish events", "async")
+
+Rel(financialService, kafka, "Consume events", "exactly-once")
+Rel(financialService, financialDB, "Update ledger", "SAGA")
+
+Rel(analyticsService, kafka, "Consume events", "batch")
+Rel(analyticsService, analyticsDB, "Write aggregates", "")
+
+Rel(campaignService, campaignDB, "CRUD", "")
+
+Rel(adminService, campaignService, "Manage", "")
+Rel(notificationService, kafka, "Consume events", "")
+
+legend right
+  Full Microservices Architecture
+  P99: < 50ms
+  RPS: 50,000
+  SLA: 99.9%
+  Multi-region ready
+endlegend
+@enduml
+

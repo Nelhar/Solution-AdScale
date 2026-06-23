@@ -1,0 +1,46 @@
+﻿@startuml to_be_mvp
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+LAYOUT_LEFT_RIGHT()
+
+title C4 Container Diagram — AdScale (TO-BE MVP)
+
+Person(advertiser, "Рекламодатель", "Управляет кампаниями")
+Person_Ext(endUser, "Пользователь сайта/приложения", "")
+System_Ext(dspPartner, "DSP-партнёр", "")
+System_Ext(paymentGateway, "Платёжный шлюз", "")
+
+Container(nginx, "Nginx", "Nginx", "Маршрутизация, TLS, Load Balancing")
+Container(bff, "BFF Layer", "Go/Node.js", "Валидация OpenRTB, Rate limiting, Auth")
+
+Container(envoy, "Envoy Proxy", "Envoy", "Circuit Breaker, Retry, Tracing")
+
+Container(biddingService, "Bidding Service", "Go", "Auction Engine + Campaign Matching")
+Container(deliveryService, "Delivery Service", "Node.js", "Формирует баннер")
+Container(campaignService, "Campaign Service", "Go", "Управление кампаниями")
+Container(financialService, "Financial Service", "Go", "Списание средств")
+Container(adCabinet, "Advertiser Dashboard", "Node.js + React", "Web UI")
+
+Container(redis, "Redis Cache", "Redis", "Campaigns (5min TTL), Budgets")
+Container(kafka, "Kafka", "Kafka (1 broker)", "impressions.recorded, clicks.recorded")
+ContainerDb(postgresWrite, "PostgreSQL Master", "PostgreSQL", "OLTP writes")
+ContainerDb(postgresRead, "PostgreSQL Slave", "PostgreSQL", "OLAP reads")
+
+Rel(dspPartner, nginx, "Bid requests", "HTTPS / OpenRTB")
+Rel_D(nginx, bff, "Route /v2/bid", "P99 < 5ms")
+Rel_D(bff, envoy, "Forward bid", "via Envoy")
+Rel_D(envoy, biddingService, "Get winning ad", "gRPC, P99 < 50ms")
+Rel(biddingService, redis, "Read campaigns", "1ms (95% hit)")
+Rel(biddingService, postgresWrite, "Read bids", "when needed")
+Rel_D(biddingService, deliveryService, "Pass winner", "Internal")
+Rel_R(biddingService, kafka, "impression.recorded", "async")
+Rel(postgresWrite, postgresRead, "Async binary log", "replication")
+
+legend right
+  Green: MVP Optimizations
+  P95 latency: 50-60ms
+  RPS: 18,000
+endlegend
+@enduml
+
